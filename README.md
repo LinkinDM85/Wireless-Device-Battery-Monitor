@@ -32,7 +32,7 @@ Battery levels of your wireless mouse, headset, keyboard and controller, right o
 - **Theme:** it follows light/dark mode and DPI scaling.
 - **Transparent taskbar themes** (e.g. Windhawk's Taskbar Styler): turn on *Background behind taskbar text* in the menu to keep the text readable over the wallpaper.
 
-**Tray icons:** one icon per device with the number drawn in it, plus a "Low battery" notification at 15% (adjustable). The app switches to this automatically when the taskbar is vertical or can't be found.
+**Tray icons:** one icon per device with the number drawn in it, plus a "Low battery" notification at 15% (adjustable). The app switches to this automatically while the taskbar can't be found.
 
 Hover for details, including an estimate of the time left (e.g. `~3 days left`) once the level has dropped a few percent. Click for the menu: every device (point at one to show, hide or move it, set its own warning level, or stop the app from querying it), display mode, *Settings*, *Refresh now*, *Start with Windows*, and *Exit*.
 
@@ -217,7 +217,7 @@ the remaining vendors are planned follow-up phases.
 
 ## Limitations
 
-- **Primary monitor only:** the taskbar widget sits on the primary monitor's taskbar.
+- **Secondary monitors:** the widget also appears on the taskbars of other monitors when they have a window to sit next to (a tray or clock window, as with StartAllBack). Windows 11's own secondary taskbars draw their clock without one, so they get no widget. Vertical taskbars show one device per row.
 - **Crowded taskbars:** with a very full centered Windows 11 taskbar, the app buttons can reach the widget. On Windows 10 the task-button area is narrowed automatically.
 - **Phones:** read from a file Phone Link writes for the Start menu companion card, which is not a documented API and may change with Phone Link updates. The phone shows while Phone Link reports it as connected; a card older than 3 hours is shown dimmed. Charging state is not available there.
 - **Sleeping devices:** a device that is asleep may not answer. Its last value stays visible, dimmed. Logitech receivers drop sleeping devices from the link, so their last value is kept for 30 minutes.
@@ -236,7 +236,7 @@ Each vendor driver in [`src/drivers/`](src/drivers) recognises its devices by US
 
 [`src/drivers/registry.cpp`](src/drivers/registry.cpp) lists the drivers in the order they run, each with the vendor ids it may touch. Drivers that share a vendor id run one after another in that order; groups with nothing in common run at the same time, each seeing only its own vendors' devices ([`src/poll_scheduler.h`](src/poll_scheduler.h)). A driver that asks about a vendor id it did not declare makes the app go back to running everything one after another, and `--list` reports it. `tests/driver_registry_test.cpp` checks the declarations.
 
-The taskbar widget is a layered child window of `Shell_TrayWnd`, placed left of `TrayNotifyWnd`. If Explorer restarts, it is re-created.
+The taskbar widget is a layered child window of `Shell_TrayWnd`, placed left of `TrayNotifyWnd` (above it on a vertical taskbar), plus one on each `Shell_SecondaryTrayWnd` next to the run of small windows at its far end. If Explorer restarts or a taskbar moves to another edge, they are re-created; taskbars that appear later get theirs within a second.
 
 ## Credits
 
