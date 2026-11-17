@@ -1,6 +1,8 @@
 // Wireless Battery - tray app showing the battery level of wireless mice, headsets and Bluetooth devices.
 #include <windows.h>
 #include <shellapi.h>
+#include <commdlg.h>
+#include <mmsystem.h>
 #include <dbt.h>
 #include <initguid.h>
 #include <hidclass.h>
@@ -42,7 +44,7 @@ constexpr int kMaxIgnored = 32;
 
 enum MenuId : UINT {
     ID_REFRESH = 100, ID_AUTOSTART, ID_HIDE_LAST_KNOWN, ID_WIDGET_BACKGROUND, ID_EXIT, ID_MODE_WIDGET, ID_MODE_TRAY, ID_SUPPORT,
-    ID_NOTIFY_LOW, ID_ADAPTIVE,
+    ID_NOTIFY_LOW, ID_ADAPTIVE, ID_SOUND_DEFAULT, ID_SOUND_NONE, ID_SOUND_FILE, ID_SOUND_TEST,
     ID_LOW_FIRST = 200,       // + index into kLowChoices
     ID_INTERVAL_FIRST = 300,  // + index into kIntervalChoices
     ID_UNIGNORE_FIRST = 400,  // + index into the ignored list
@@ -71,6 +73,8 @@ bool g_useWidget = false;      // what is actually shown right now
 bool g_hideLastKnown = false;  // hide (last known) / asleep devices from taskbar and tray
 bool g_widgetBackground = false;  // draw a plate behind the taskbar text (transparent taskbar themes)
 bool g_notifyLow = true;          // show a notification when a device drops to its warning level
+// Low battery sound: empty = the Windows notification sound, L"none" = silent, else a .wav / .mp3 file.
+std::wstring g_lowSound;
 int g_lowDefault = kDefaultLow;   // warning level for devices without their own
 
 // Read by the worker thread.
@@ -248,6 +252,10 @@ void LoadSettings() {
     g_adaptive = LoadBoolSetting(L"AdaptivePolling", true);
     g_parallel = LoadBoolSetting(L"ParallelPolling", true);  // registry only, for troubleshooting
     LoadDeviceLow();
+    wchar_t sound[MAX_PATH] = {};
+    DWORD size = sizeof(sound);
+    if (RegGetValueW(HKEY_CURRENT_USER, kSettingsKey, L"LowBatterySound", RRF_RT_REG_SZ, nullptr, sound, &size) == ERROR_SUCCESS)
+        g_lowSound = sound;
 }
 
 // Discharge history per device (battery_trend.h), in HKCU\Software\WirelessBattery\Trends, one REG_SZ
@@ -451,6 +459,7 @@ void TrayCall(DWORD msg, UINT uid, HICON icon, const std::wstring& tip, const wc
         CopyTip(nid.szInfoTitle, ARRAYSIZE(nid.szInfoTitle), infoTitle);
         CopyTip(nid.szInfo, ARRAYSIZE(nid.szInfo), info);
         nid.dwInfoFlags = NIIF_WARNING;
+        if (!g_lowSound.empty()) nid.dwInfoFlags |= NIIF_NOSOUND;  // our own sound (or none) instead
     }
     Shell_NotifyIconW(msg, &nid);
     if (msg == NIM_ADD) {
@@ -568,6 +577,63 @@ void UpdateWidget() {
     widget::SetItems(items, tip);
 }
 
+// ---- low battery sound -------------------------------------------------------------------------
+// .wav files go through PlaySound; anything else (.mp3, .wma) through MCI. Both play asynchronously.
+// A file that cannot be played (moved, deleted) falls back to the standard warning beep.
+
+bool g_mciOpen = false;
+
+void StopLowSound() {
+    if (g_mciOpen) {
+        mciSendStringW(L"close wb_lowbattery", nullptr, 0, nullptr);
+        g_mciOpen = false;
+    }
+    PlaySoundW(nullptr, nullptr, 0);
+}
+
+void PlayLowSound() {
+    if (g_lowSound.empty() || g_lowSound == L"none") return;  // Windows' own sound comes with the notification
+    StopLowSound();
+    const std::wstring& f = g_lowSound;
+    bool wav = f.size() > 4 && _wcsicmp(f.c_str() + f.size() - 4, L".wav") == 0;
+    bool ok = false;
+    if (GetFileAttributesW(f.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        if (wav) {
+            ok = PlaySoundW(f.c_str(), nullptr, SND_FILENAME | SND_ASYNC | SND_NODEFAULT);
+        } else {
+            std::wstring open = L"open \"" + f + L"\" type mpegvideo alias wb_lowbattery";
+            g_mciOpen = mciSendStringW(open.c_str(), nullptr, 0, nullptr) == 0;
+            ok = g_mciOpen && mciSendStringW(L"play wb_lowbattery", nullptr, 0, nullptr) == 0;
+        }
+    }
+    if (!ok) MessageBeep(MB_ICONWARNING);
+}
+
+std::wstring FileNameOf(const std::wstring& path) {
+    size_t slash = path.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? path : path.substr(slash + 1);
+}
+
+void SetLowSound(const std::wstring& value) {
+    g_lowSound = value;
+    RegSetKeyValueW(HKEY_CURRENT_USER, kSettingsKey, L"LowBatterySound", REG_SZ, value.c_str(), (DWORD)((value.size() + 1) * sizeof(wchar_t)));
+}
+
+void ChooseLowSound() {
+    wchar_t file[MAX_PATH] = {};
+    if (!g_lowSound.empty() && g_lowSound != L"none") wcsncpy(file, g_lowSound.c_str(), MAX_PATH - 1);
+    OPENFILENAMEW ofn{ sizeof(ofn) };
+    ofn.hwndOwner = g_hwnd;
+    ofn.lpstrFilter = L"Sounds (*.wav, *.mp3, *.wma)\0*.wav;*.mp3;*.wma\0All files\0*.*\0";
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrTitle = L"Low battery sound";
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_HIDEREADONLY;
+    if (!GetOpenFileNameW(&ofn)) return;
+    SetLowSound(file);
+    PlayLowSound();  // let the user hear what they picked
+}
+
 // True once per discharge, when a device first reports its warning level or lower. Runs in both
 // display modes so switching modes neither repeats nor loses a warning.
 bool TakeLowWarning(TrayEntry& e) {
@@ -622,6 +688,7 @@ void UpdateNotice() {
 
 void OnResults(std::vector<DeviceStatus>& results) {
     std::map<std::wstring, bool> seen;
+    bool warned = false;
     for (auto& s : results) {
         auto& e = g_entries[s.key];
         if (!e.uid) e.uid = StableId(s.key);
@@ -637,6 +704,7 @@ void OnResults(std::vector<DeviceStatus>& results) {
         if (s.connected && !s.asleep && s.percent >= 0 && s.levelText.empty() && e.trend.Update(s.percent, s.charging, WallClock()))
             SaveTrend(s.key, e.trend);
         e.warnNow = TakeLowWarning(e) && g_notifyLow && !IsHidden(s.key);
+        warned |= e.warnNow;
         ApplyEntry(e);
     }
     for (auto it = g_entries.begin(); it != g_entries.end();) {
@@ -660,6 +728,7 @@ void OnResults(std::vector<DeviceStatus>& results) {
     UpdatePlaceholder();
     UpdateWidget();
     UpdateNotice();
+    if (warned) PlayLowSound();
 }
 
 // Makes the actual display match the chosen mode; falls back to tray icons if the taskbar
@@ -873,6 +942,16 @@ void ShowMenu() {
         CheckMenuRadioItem(lowMenu, ID_LOW_FIRST, ID_LOW_FIRST + (UINT)std::size(kLowChoices) - 1, ID_LOW_FIRST + (UINT)lowIdx, MF_BYCOMMAND);
         AppendMenuW(settings, MF_POPUP, (UINT_PTR)lowMenu, L"Low battery warning at");
         AppendMenuW(settings, MF_STRING | (g_notifyLow ? MF_CHECKED : 0), ID_NOTIFY_LOW, L"Low battery notifications");
+        HMENU sound = CreatePopupMenu();
+        bool custom = !g_lowSound.empty() && g_lowSound != L"none";
+        AppendMenuW(sound, MF_STRING, ID_SOUND_DEFAULT, L"Windows default");
+        AppendMenuW(sound, MF_STRING, ID_SOUND_NONE, L"None");
+        AppendMenuW(sound, MF_STRING, ID_SOUND_FILE, custom ? (L"File: " + FileNameOf(g_lowSound) + L"...").c_str() : L"Choose a file...");
+        CheckMenuRadioItem(sound, ID_SOUND_DEFAULT, ID_SOUND_FILE,
+                           g_lowSound.empty() ? ID_SOUND_DEFAULT : custom ? ID_SOUND_FILE : ID_SOUND_NONE, MF_BYCOMMAND);
+        AppendMenuW(sound, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(sound, MF_STRING | (custom ? 0 : MF_GRAYED), ID_SOUND_TEST, L"Play it now");
+        AppendMenuW(settings, MF_POPUP | (g_notifyLow ? 0 : MF_GRAYED), (UINT_PTR)sound, L"Low battery sound");
         AppendMenuW(settings, MF_SEPARATOR, 0, nullptr);
         HMENU every = CreatePopupMenu();
         const wchar_t* intervalNames[] = { L"30 seconds", L"1 minute", L"2 minutes", L"5 minutes", L"10 minutes" };
@@ -917,6 +996,10 @@ void ShowMenu() {
         case ID_EXIT: DestroyWindow(g_hwnd); break;
         case ID_NOTIFY_LOW: SetNotifyLow(!g_notifyLow); break;
         case ID_ADAPTIVE: SetAdaptive(!g_adaptive); break;
+        case ID_SOUND_DEFAULT: StopLowSound(); SetLowSound(L""); break;
+        case ID_SOUND_NONE: StopLowSound(); SetLowSound(L"none"); break;
+        case ID_SOUND_FILE: ChooseLowSound(); break;
+        case ID_SOUND_TEST: PlayLowSound(); break;
         default:
             if (cmd >= ID_LOW_FIRST && cmd < ID_LOW_FIRST + std::size(kLowChoices)) {
                 SetLowDefault(kLowChoices[cmd - ID_LOW_FIRST]);
@@ -1028,6 +1111,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             }
             if (g_placeholder) TrayDelete(PLACEHOLDER_ID);
             if (g_notice) TrayDelete(NOTICE_ID);
+            StopLowSound();
             PostQuitMessage(0);
             return 0;
     }

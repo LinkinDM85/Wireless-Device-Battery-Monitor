@@ -36,7 +36,7 @@ Battery levels of your wireless mouse, headset, keyboard and controller, right o
 
 Hover for details, including an estimate of the time left (e.g. `~3 days left`) once the level has dropped a few percent. Click for the menu: every device (point at one to show, hide or move it, set its own warning level, or stop the app from querying it), display mode, *Settings*, *Refresh now*, *Start with Windows*, and *Exit*.
 
-**Settings:** the warning level (5–40 %), low battery notifications on or off, how often to refresh (30 seconds to 10 minutes, default 1 minute), and *Ask devices less often while nothing changes* (on by default: a device that keeps reporting the same level is asked every 2, then 4, then 5 minutes, and asleep or switched-off devices every 5 minutes, so polling does not keep waking them). Every device is asked again right away when one is plugged in or removed, when the PC wakes up, and on *Refresh now*.
+**Settings:** the warning level (5–40 %), low battery notifications on or off, the low battery sound (the Windows notification sound, none, or your own `.wav` / `.mp3` file), how often to refresh (30 seconds to 10 minutes, default 1 minute), and *Ask devices less often while nothing changes* (on by default: a device that keeps reporting the same level is asked every 2, then 4, then 5 minutes, and asleep or switched-off devices every 5 minutes, so polling does not keep waking them). Every device is asked again right away when one is plugged in or removed, when the PC wakes up, and on *Refresh now*.
 
 ## Supported devices
 
