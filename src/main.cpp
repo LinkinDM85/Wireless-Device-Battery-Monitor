@@ -1039,7 +1039,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 //   --timing      how long each driver took, and whether drivers ran in parallel
 //   --sequential  run the drivers one after another (as before parallel polling)
 struct ListFlags {
-    bool dump = false, json = false, timing = false, sequential = false;
+    bool dump = false, json = false, timing = false, sequential = false, taskbars = false;
 };
 
 int ListToConsole(const ListFlags& flags) {
@@ -1056,6 +1056,10 @@ int ListToConsole(const ListFlags& flags) {
     };
     if (flags.dump) {
         write(DumpHidCollections());
+        return 0;
+    }
+    if (flags.taskbars) {
+        write(widget::DescribeTaskbars());
         return 0;
     }
     PollScheduler scheduler(AllDrivers());
@@ -1107,8 +1111,9 @@ int ListToConsole(const ListFlags& flags) {
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
-    if (cmdLine && (wcsstr(cmdLine, L"--list") || wcsstr(cmdLine, L"--dump") || wcsstr(cmdLine, L"--json"))) {
+    if (cmdLine && (wcsstr(cmdLine, L"--list") || wcsstr(cmdLine, L"--dump") || wcsstr(cmdLine, L"--json") || wcsstr(cmdLine, L"--taskbars"))) {
         ListFlags f;
+        f.taskbars = wcsstr(cmdLine, L"--taskbars") != nullptr;
         f.dump = wcsstr(cmdLine, L"--dump") != nullptr;
         f.json = wcsstr(cmdLine, L"--json") != nullptr;
         f.timing = wcsstr(cmdLine, L"--timing") != nullptr;

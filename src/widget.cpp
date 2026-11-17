@@ -493,3 +493,66 @@ bool Reposition() {
 }
 
 }  // namespace widget
+
+namespace {
+
+struct DescribeCtx {
+    HWND root;
+    std::wstring* out;
+    int lines;
+};
+
+std::wstring WindowLine(HWND w, int depth) {
+    wchar_t cls[128] = {}, text[64] = {};
+    GetClassNameW(w, cls, 128);
+    InternalGetWindowText(w, text, 64);  // does not send messages to Explorer
+    RECT r{};
+    GetWindowRect(w, &r);
+    wchar_t line[400];
+    swprintf(line, 400, L"%*ls%ls  [%ld,%ld - %ld,%ld  %ldx%ld]%ls%ls%ls%ls\n", depth * 2, L"", cls, r.left, r.top, r.right, r.bottom,
+             r.right - r.left, r.bottom - r.top, IsWindowVisible(w) ? L"" : L"  hidden", text[0] ? L"  \"" : L"", text,
+             text[0] ? L"\"" : L"");
+    return line;
+}
+
+BOOL CALLBACK DescribeChild(HWND w, LPARAM lp) {
+    auto* ctx = reinterpret_cast<DescribeCtx*>(lp);
+    int depth = 0;
+    for (HWND p = w; p && p != ctx->root; p = GetParent(p)) depth++;
+    if (depth > 5 || ++ctx->lines > 300) return TRUE;
+    *ctx->out += WindowLine(w, depth);
+    return TRUE;
+}
+
+BOOL CALLBACK DescribeTop(HWND w, LPARAM lp) {
+    wchar_t cls[64] = {};
+    GetClassNameW(w, cls, 64);
+    if (wcscmp(cls, L"Shell_TrayWnd") && wcscmp(cls, L"Shell_SecondaryTrayWnd")) return TRUE;
+    auto* out = reinterpret_cast<std::wstring*>(lp);
+    HMONITOR mon = MonitorFromWindow(w, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{ sizeof(mi) };
+    GetMonitorInfoW(mon, &mi);
+    RECT r{};
+    GetWindowRect(w, &r);
+    wchar_t head[200];
+    swprintf(head, 200, L"\n=== %ls on monitor [%ld,%ld - %ld,%ld]%ls, %ls, dpi %u\n", cls, mi.rcMonitor.left, mi.rcMonitor.top,
+             mi.rcMonitor.right, mi.rcMonitor.bottom, (mi.dwFlags & MONITORINFOF_PRIMARY) ? L" (primary)" : L"",
+             (r.bottom - r.top > r.right - r.left) ? L"vertical" : L"horizontal", GetDpiForWindow(w));
+    *out += head;
+    *out += WindowLine(w, 0);
+    DescribeCtx ctx{ w, out, 0 };
+    EnumChildWindows(w, DescribeChild, (LPARAM)&ctx);
+    return TRUE;
+}
+
+}  // namespace
+
+namespace widget {
+
+std::wstring DescribeTaskbars() {
+    std::wstring out = L"Taskbars (class  [left,top - right,bottom  width x height]):\n";
+    EnumWindows(DescribeTop, (LPARAM)&out);
+    return out;
+}
+
+}  // namespace widget

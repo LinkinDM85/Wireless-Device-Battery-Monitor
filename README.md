@@ -153,6 +153,7 @@ WirelessBattery.exe --list               # print every device and its battery le
 WirelessBattery.exe --list --json        # the same as JSON (UTF-8), for scripts, Rainmeter, OBS and the like
 WirelessBattery.exe --list --timing      # also show how long each driver took and whether they ran in parallel
 WirelessBattery.exe --list --sequential  # run the drivers one after another (for troubleshooting)
+WirelessBattery.exe --taskbars           # print every taskbar window and its children (for multi-monitor / taskbar mod problems)
 WirelessBattery.exe --dump   # print every HID collection, plus raw Xenta (1D57) status frames (useful when asking for a new device)
 WirelessBattery.exe --quit   # close the running instance
 ```
