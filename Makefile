@@ -39,7 +39,7 @@ test:
 	        echo "$$t: first line must be // test-sources: ..."; failed="$$failed $$n"; continue; \
 	    fi; \
 	    echo "== $$n"; \
-	    if $(CXX) $(CXXFLAGS) $$t $$src -o build/tests/$$n.exe && ./build/tests/$$n.exe; then :; \
+	    if $(CXX) $(CXXFLAGS) $$t $$src -o build/tests/$$n.exe $(LIBS) && ./build/tests/$$n.exe; then :; \
 	    else failed="$$failed $$n"; [ -n "$$GITHUB_ACTIONS" ] && echo "::error title=Test failed::$$n"; fi; \
 	done; \
 	if [ -n "$$failed" ]; then echo "FAILED:$$failed"; exit 1; fi; \
