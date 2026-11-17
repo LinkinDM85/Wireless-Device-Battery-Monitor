@@ -6,14 +6,21 @@
 #include <hidclass.h>
 
 #include <algorithm>
+#include <atomic>
 #include <climits>
 #include <cstdio>
+#include <ctime>
+#include <iterator>
 #include <map>
 #include <set>
 #include <string>
 #include <vector>
 
+#include "battery_trend.h"
 #include "devices.h"
+#include "drivers/registry.h"
+#include "json_report.h"
+#include "poll_scheduler.h"
 #include "widget.h"
 
 namespace {
@@ -23,15 +30,30 @@ constexpr UINT WM_RESULTS = WM_APP + 2;
 constexpr UINT WM_WIDGET_CLICK = WM_APP + 3;
 constexpr UINT_PTR TIMER_DEBOUNCE = 1;
 constexpr UINT_PTR TIMER_WIDGET = 2;
-constexpr DWORD POLL_INTERVAL_MS = 60 * 1000;
-constexpr int LOW_BATTERY = 15;
 constexpr UINT PLACEHOLDER_ID = 1;
+constexpr UINT NOTICE_ID = 2;  // low-battery icon used while the taskbar widget is shown
+
+// Choices offered in the menu.
+constexpr int kLowChoices[] = { 5, 10, 15, 20, 25, 30, 40 };     // percent
+constexpr int kIntervalChoices[] = { 30, 60, 120, 300, 600 };   // seconds
+constexpr int kDefaultLow = 15;
+constexpr int kDefaultIntervalSec = 60;
+constexpr int kMaxIgnored = 32;
 
 enum MenuId : UINT {
     ID_REFRESH = 100, ID_AUTOSTART, ID_HIDE_LAST_KNOWN, ID_WIDGET_BACKGROUND, ID_EXIT, ID_MODE_WIDGET, ID_MODE_TRAY, ID_SUPPORT,
+    ID_NOTIFY_LOW, ID_ADAPTIVE,
+    ID_LOW_FIRST = 200,       // + index into kLowChoices
+    ID_INTERVAL_FIRST = 300,  // + index into kIntervalChoices
+    ID_UNIGNORE_FIRST = 400,  // + index into the ignored list
     ID_DEVICE_FIRST = 1000
 };
-enum DeviceCmd : UINT { DEV_TOGGLE, DEV_LEFT, DEV_RIGHT, DEV_STRIDE = 4 };
+// Per-device commands: ID_DEVICE_FIRST + device index * DEV_STRIDE + command.
+enum DeviceCmd : UINT {
+    DEV_TOGGLE, DEV_LEFT, DEV_RIGHT, DEV_IGNORE, DEV_LOW_DEFAULT, DEV_LOW_NEVER,
+    DEV_LOW_FIRST,  // + index into kLowChoices
+    DEV_STRIDE = 16
+};
 
 const wchar_t* kAppName = L"Wireless Battery";
 const wchar_t* kRunKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -48,6 +70,13 @@ bool g_wantWidget = true;      // user's choice: taskbar widget (default) or tra
 bool g_useWidget = false;      // what is actually shown right now
 bool g_hideLastKnown = false;  // hide (last known) / asleep devices from taskbar and tray
 bool g_widgetBackground = false;  // draw a plate behind the taskbar text (transparent taskbar themes)
+bool g_notifyLow = true;          // show a notification when a device drops to its warning level
+int g_lowDefault = kDefaultLow;   // warning level for devices without their own
+
+// Read by the worker thread.
+std::atomic<DWORD> g_pollMs{ kDefaultIntervalSec * 1000 };
+std::atomic<bool> g_adaptive{ true };
+std::atomic<bool> g_parallel{ true };
 
 struct TrayEntry {
     UINT uid = 0;
@@ -56,12 +85,18 @@ struct TrayEntry {
     ULONGLONG lastSeen = 0;
     bool added = false;
     bool lowWarned = false;
+    bool warnNow = false;    // dropped to its warning level in this poll: notify once
+    BatteryTrend trend;      // discharge history for the "~N h left" estimate
+    bool trendLoaded = false;
     std::wstring iconSig;    // what the current icon shows, to avoid needless redraws
     HICON icon = nullptr;
 };
 std::map<std::wstring, TrayEntry> g_entries;
 bool g_placeholder = false;
 HICON g_placeholderIcon = nullptr;
+bool g_notice = false;
+HICON g_noticeIcon = nullptr;
+std::wstring g_noticeSig;
 
 // ---- helpers ----------------------------------------------------------------------------------
 
@@ -160,6 +195,89 @@ bool LoadHideLastKnown() { return LoadBoolSetting(L"HideLastKnownDevices", false
 void SaveHideLastKnown(bool on) { SaveBoolSetting(L"HideLastKnownDevices", on); }
 bool LoadWidgetBackground() { return LoadBoolSetting(L"WidgetBackground", false); }
 void SaveWidgetBackground(bool on) { SaveBoolSetting(L"WidgetBackground", on); }
+
+DWORD LoadDwordSetting(const wchar_t* name, DWORD defaultVal) {
+    DWORD v = defaultVal, sz = sizeof(v);
+    if (RegGetValueW(HKEY_CURRENT_USER, kSettingsKey, name, RRF_RT_REG_DWORD, nullptr, &v, &sz) != ERROR_SUCCESS) return defaultVal;
+    return v;
+}
+void SaveDwordSetting(const wchar_t* name, DWORD v) { RegSetKeyValueW(HKEY_CURRENT_USER, kSettingsKey, name, REG_DWORD, &v, sizeof(v)); }
+
+template <size_t N>
+bool OneOf(int v, const int (&choices)[N]) { return std::find(std::begin(choices), std::end(choices), v) != std::end(choices); }
+
+// Per-device warning levels (device key -> percent, 0 = never warn), stored as a REG_MULTI_SZ of
+// "key<TAB>percent" strings. Devices not listed use g_lowDefault.
+std::map<std::wstring, int> g_deviceLow;
+
+void LoadDeviceLow() {
+    DWORD size = 0;
+    if (RegGetValueW(HKEY_CURRENT_USER, kSettingsKey, L"DeviceLowBattery", RRF_RT_REG_MULTI_SZ, nullptr, nullptr, &size) != ERROR_SUCCESS || !size)
+        return;
+    std::vector<wchar_t> buf(size / sizeof(wchar_t) + 1, 0);
+    if (RegGetValueW(HKEY_CURRENT_USER, kSettingsKey, L"DeviceLowBattery", RRF_RT_REG_MULTI_SZ, nullptr, buf.data(), &size) != ERROR_SUCCESS)
+        return;
+    for (const wchar_t* p = buf.data(); *p; p += wcslen(p) + 1) {
+        std::wstring s = p;
+        size_t tab = s.rfind(L'\t');
+        if (tab == std::wstring::npos) continue;
+        int v = _wtoi(s.c_str() + tab + 1);
+        if (v == 0 || OneOf(v, kLowChoices)) g_deviceLow[s.substr(0, tab)] = v;
+    }
+}
+
+void SaveDeviceLow() {
+    std::wstring multi;
+    for (const auto& [k, v] : g_deviceLow) { multi += k + L"\t" + std::to_wstring(v); multi.push_back(L'\0'); }
+    multi.push_back(L'\0');
+    RegSetKeyValueW(HKEY_CURRENT_USER, kSettingsKey, L"DeviceLowBattery", REG_MULTI_SZ, multi.data(), (DWORD)(multi.size() * sizeof(wchar_t)));
+}
+
+// Warning level for a device: percent, or 0 = never warn.
+int LowFor(const std::wstring& key) {
+    auto it = g_deviceLow.find(key);
+    return it != g_deviceLow.end() ? it->second : g_lowDefault;
+}
+
+void LoadSettings() {
+    g_notifyLow = LoadBoolSetting(L"LowBatteryNotifications", true);
+    int low = (int)LoadDwordSetting(L"LowBattery", kDefaultLow);
+    g_lowDefault = OneOf(low, kLowChoices) ? low : kDefaultLow;
+    int sec = (int)LoadDwordSetting(L"PollSeconds", kDefaultIntervalSec);
+    g_pollMs = (DWORD)(OneOf(sec, kIntervalChoices) ? sec : kDefaultIntervalSec) * 1000;
+    g_adaptive = LoadBoolSetting(L"AdaptivePolling", true);
+    g_parallel = LoadBoolSetting(L"ParallelPolling", true);  // registry only, for troubleshooting
+    LoadDeviceLow();
+}
+
+// Discharge history per device (battery_trend.h), in HKCU\Software\WirelessBattery\Trends, one REG_SZ
+// per device key. Written only when the level drops to a new low or the device is charged.
+const wchar_t* kTrendsKey = L"Software\\WirelessBattery\\Trends";
+
+int64_t WallClock() { return (int64_t)time(nullptr); }
+
+BatteryTrend LoadTrend(const std::wstring& key) {
+    wchar_t buf[128];
+    DWORD size = sizeof(buf);
+    if (RegGetValueW(HKEY_CURRENT_USER, kTrendsKey, key.c_str(), RRF_RT_REG_SZ, nullptr, buf, &size) != ERROR_SUCCESS) return {};
+    std::string s;
+    for (const wchar_t* p = buf; *p; p++) s.push_back((char)*p);  // ASCII digits and commas
+    return BatteryTrend::Parse(s, WallClock());
+}
+
+void SaveTrend(const std::wstring& key, const BatteryTrend& t) {
+    std::string s = t.Serialize();
+    if (s.empty()) {
+        HKEY k;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, kTrendsKey, 0, KEY_SET_VALUE, &k) == ERROR_SUCCESS) {
+            RegDeleteValueW(k, key.c_str());
+            RegCloseKey(k);
+        }
+        return;
+    }
+    std::wstring w(s.begin(), s.end());
+    RegSetKeyValueW(HKEY_CURRENT_USER, kTrendsKey, key.c_str(), REG_SZ, w.c_str(), (DWORD)((w.size() + 1) * sizeof(wchar_t)));
+}
 
 bool AutostartEnabled() {
     wchar_t buf[MAX_PATH * 2];
@@ -280,13 +398,16 @@ HICON RenderIcon(const std::wstring& text, int barPct, Rgb textColor, Rgb barCol
 
 Rgb Foreground() { return g_lightTaskbar ? Rgb{ 0, 0, 0 } : Rgb{ 255, 255, 255 }; }
 
-HICON IconFor(int pct, bool charging, bool dim) {
+bool IsLowLevel(int pct, bool charging, int low) { return low > 0 && !charging && pct >= 0 && pct <= low; }
+
+// `low` is the device's warning level (0 = never warn).
+HICON IconFor(int pct, bool charging, bool dim, int low) {
     Rgb fg = Foreground();
-    Rgb bar = charging        ? Rgb{ 0, 170, 255 }
-            : pct <= LOW_BATTERY ? Rgb{ 232, 32, 48 }
-            : pct <= 30       ? Rgb{ 255, 150, 0 }
-                              : Rgb{ 30, 190, 90 };
-    Rgb text = (!charging && pct >= 0 && pct <= LOW_BATTERY) ? Rgb{ 240, 50, 60 } : fg;
+    Rgb bar = charging                   ? Rgb{ 0, 170, 255 }
+            : IsLowLevel(pct, false, low) ? Rgb{ 232, 32, 48 }
+            : pct <= 30                  ? Rgb{ 255, 150, 0 }
+                                         : Rgb{ 30, 190, 90 };
+    Rgb text = IsLowLevel(pct, charging, low) ? Rgb{ 240, 50, 60 } : fg;
     std::wstring t = pct < 0 ? L"?" : std::to_wstring(pct);
     return RenderIcon(t, pct, text, bar, dim);
 }
@@ -309,6 +430,10 @@ std::wstring StatusText(const TrayEntry& e) {
     if (!s.detail.empty() && s.percent >= 0) t += L" (" + s.detail + L")";
     if (s.charging) t += L", charging";
     if (s.asleep) t += L", asleep";
+    if (!s.charging && (s.percent >= 0 || e.lastPct >= 0)) {
+        std::wstring left = FormatRemaining(e.trend.RemainingSec(WallClock()));
+        if (!left.empty()) t += L", " + left + L" left";
+    }
     return t;
 }
 
@@ -367,19 +492,20 @@ void ApplyEntry(TrayEntry& e) {
     }
     int shown = s.percent >= 0 ? s.percent : e.lastPct;
     bool dim = s.percent < 0;
-    std::wstring sig = std::to_wstring(shown) + (s.charging ? L"c" : L"") + (dim ? L"d" : L"") + (g_lightTaskbar ? L"l" : L"k");
+    int low = LowFor(s.key);
+    std::wstring sig = std::to_wstring(shown) + (s.charging ? L"c" : L"") + (dim ? L"d" : L"") + (g_lightTaskbar ? L"l" : L"k") +
+                       L"/" + std::to_wstring(low);
     if (sig != e.iconSig || !e.icon) {
         if (e.icon) DestroyIcon(e.icon);
-        e.icon = IconFor(shown, s.charging, dim);
+        e.icon = IconFor(shown, s.charging, dim, low);
         e.iconSig = sig;
     }
     std::wstring tip = s.name + L"\n" + StatusText(e);
 
     const wchar_t* infoTitle = nullptr;
     std::wstring info;
-    if (s.charging || shown > LOW_BATTERY + 10) e.lowWarned = false;
-    if (!s.charging && s.percent >= 0 && s.percent <= LOW_BATTERY && !e.lowWarned) {
-        e.lowWarned = true;
+    if (e.warnNow) {  // see TakeLowWarning
+        e.warnNow = false;
         infoTitle = L"Low battery";
         info = s.name + L" is at " + std::to_wstring(s.percent) + L"%";
     }
@@ -432,7 +558,7 @@ void UpdateWidget() {
         if (e->st.percent >= 0) it.text = e->st.levelText;
         it.charging = e->st.charging;
         it.dim = e->st.percent < 0;
-        it.low = !it.charging && it.percent >= 0 && it.percent <= LOW_BATTERY;
+        it.low = IsLowLevel(it.percent, it.charging, LowFor(e->st.key));
         it.bluetooth = e->st.via == L"Bluetooth";
         items.push_back(it);
         if (!tip.empty()) tip += L"\n";
@@ -440,6 +566,58 @@ void UpdateWidget() {
     }
     if (tip.empty()) tip = L"Wireless Battery: no devices with battery info found";
     widget::SetItems(items, tip);
+}
+
+// True once per discharge, when a device first reports its warning level or lower. Runs in both
+// display modes so switching modes neither repeats nor loses a warning.
+bool TakeLowWarning(TrayEntry& e) {
+    const auto& s = e.st;
+    int low = LowFor(s.key);
+    int shown = s.percent >= 0 ? s.percent : e.lastPct;
+    if (s.charging || low == 0 || shown > low + 10) e.lowWarned = false;
+    if (!IsLowLevel(s.percent, s.charging, low) || e.lowWarned) return false;
+    e.lowWarned = true;
+    return true;
+}
+
+// The taskbar widget is not a tray icon, so it cannot show notifications itself. While it is shown
+// and any device is at its warning level, one extra tray icon carries the lowest level (in red, the
+// same as the tray mode icons) and shows the "Low battery" notification. Windows puts new icons in
+// the overflow area, so it only shows up when there is something to say.
+void UpdateNotice() {
+    std::vector<TrayEntry*> low, fresh;
+    if (g_useWidget && g_notifyLow)
+        for (auto& [k, e] : g_entries) {
+            int pct = e.st.percent >= 0 ? e.st.percent : e.lastPct;
+            if (!IsShown(e) || !IsLowLevel(pct, e.st.charging, LowFor(k))) continue;
+            low.push_back(&e);
+            if (e.warnNow) fresh.push_back(&e);
+        }
+    for (auto& [k, e] : g_entries) e.warnNow = false;  // consumed (or not wanted) in widget mode
+    if (low.empty()) {
+        if (g_notice) { TrayDelete(NOTICE_ID); g_notice = false; }
+        return;
+    }
+    auto lowest = std::min_element(low.begin(), low.end(), [](const TrayEntry* a, const TrayEntry* b) {
+        int pa = a->st.percent >= 0 ? a->st.percent : a->lastPct, pb = b->st.percent >= 0 ? b->st.percent : b->lastPct;
+        return pa < pb;
+    });
+    int pct = (*lowest)->st.percent >= 0 ? (*lowest)->st.percent : (*lowest)->lastPct;
+    std::wstring tip = L"Low battery";
+    for (auto* e : low) tip += L"\n" + e->st.name + L": " + StatusText(*e);
+    std::wstring sig = std::to_wstring(pct) + (g_lightTaskbar ? L"l" : L"k");
+    if (sig != g_noticeSig || !g_noticeIcon) {
+        if (g_noticeIcon) DestroyIcon(g_noticeIcon);
+        g_noticeIcon = IconFor(pct, false, false, 100);
+        g_noticeSig = sig;
+    }
+    std::wstring info;
+    for (auto* e : fresh) {
+        if (!info.empty()) info += L"\n";
+        info += e->st.name + L" is at " + std::to_wstring(e->st.percent) + L"%";
+    }
+    TrayCall(g_notice ? NIM_MODIFY : NIM_ADD, NOTICE_ID, g_noticeIcon, tip, info.empty() ? nullptr : L"Low battery", info);
+    g_notice = true;
 }
 
 void OnResults(std::vector<DeviceStatus>& results) {
@@ -451,6 +629,14 @@ void OnResults(std::vector<DeviceStatus>& results) {
         if (s.percent >= 0) e.lastPct = s.percent;
         e.lastSeen = GetTickCount64();
         seen[s.key] = true;
+        if (!e.trendLoaded) {
+            e.trend = LoadTrend(s.key);
+            e.trendLoaded = true;
+        }
+        // Coarse "Low / Medium / Full" levels say too little about time to estimate anything.
+        if (s.connected && !s.asleep && s.percent >= 0 && s.levelText.empty() && e.trend.Update(s.percent, s.charging, WallClock()))
+            SaveTrend(s.key, e.trend);
+        e.warnNow = TakeLowWarning(e) && g_notifyLow && !IsHidden(s.key);
         ApplyEntry(e);
     }
     for (auto it = g_entries.begin(); it != g_entries.end();) {
@@ -473,6 +659,7 @@ void OnResults(std::vector<DeviceStatus>& results) {
     }
     UpdatePlaceholder();
     UpdateWidget();
+    UpdateNotice();
 }
 
 // Makes the actual display match the chosen mode; falls back to tray icons if the taskbar
@@ -487,6 +674,7 @@ void Reconcile() {
         for (auto& [k, e] : g_entries) ApplyEntry(e);
         UpdatePlaceholder();
         UpdateWidget();
+        UpdateNotice();
     } else if (g_useWidget) {
         widget::Reposition();
     }
@@ -504,18 +692,25 @@ void SetWidgetBackground(bool on) {
     widget::SetBackground(on);
 }
 
-void SetHideLastKnown(bool on) {
-    g_hideLastKnown = on;
-    SaveHideLastKnown(on);
+void RefreshDisplay() {
     for (auto& [k, e] : g_entries) ApplyEntry(e);
     UpdatePlaceholder();
     UpdateWidget();
+    UpdateNotice();
+}
+
+void SetHideLastKnown(bool on) {
+    g_hideLastKnown = on;
+    SaveHideLastKnown(on);
+    RefreshDisplay();
 }
 
 void ReAddAll() {
     g_placeholder = false;
+    g_notice = false;
     for (auto& [k, e] : g_entries) { e.added = false; ApplyEntry(e); }
     UpdatePlaceholder();
+    UpdateNotice();
 }
 
 void RedrawAll() {
@@ -524,17 +719,81 @@ void RedrawAll() {
         g_placeholderIcon = nullptr;
         if (g_placeholder) { TrayDelete(PLACEHOLDER_ID); g_placeholder = false; }
     }
+    g_noticeSig.clear();
     for (auto& [k, e] : g_entries) { e.iconSig.clear(); ApplyEntry(e); }
     UpdatePlaceholder();
+    UpdateNotice();
 }
 
 void ToggleHidden(const std::wstring& key) {
     if (!g_hidden.erase(key)) g_hidden.insert(key);
     SaveHidden();
-    auto it = g_entries.find(key);
-    if (it != g_entries.end()) ApplyEntry(it->second);
-    UpdatePlaceholder();
-    UpdateWidget();
+    RefreshDisplay();
+}
+
+void SetNotifyLow(bool on) {
+    g_notifyLow = on;
+    SaveBoolSetting(L"LowBatteryNotifications", on);
+    UpdateNotice();
+}
+
+void SetLowDefault(int pct) {
+    g_lowDefault = pct;
+    SaveDwordSetting(L"LowBattery", (DWORD)pct);
+    RefreshDisplay();
+}
+
+// pct: a level from kLowChoices, 0 = never warn, -1 = use the default.
+void SetDeviceLow(const std::wstring& key, int pct) {
+    if (pct < 0) g_deviceLow.erase(key);
+    else g_deviceLow[key] = pct;
+    SaveDeviceLow();
+    RefreshDisplay();
+}
+
+void SetInterval(int sec) {
+    g_pollMs = (DWORD)sec * 1000;
+    SaveDwordSetting(L"PollSeconds", (DWORD)sec);
+    SetEvent(g_refreshEvt);  // start the new rhythm now
+}
+
+void SetAdaptive(bool on) {
+    g_adaptive = on;
+    SaveBoolSetting(L"AdaptivePolling", on);
+}
+
+std::wstring UsbId(unsigned short vid, unsigned short pid) {
+    wchar_t b[16];
+    swprintf(b, 16, L"%04X:%04X", vid, pid);
+    return b;
+}
+
+// Never open this vendor/product id again (HKCU\...\IgnoreDevices), and drop what it showed.
+void IgnoreDevice(unsigned short vid, unsigned short pid) {
+    auto ids = IgnoredDeviceIds();
+    if (std::find(ids.begin(), ids.end(), std::make_pair(vid, pid)) == ids.end() && (int)ids.size() < kMaxIgnored) {
+        ids.push_back({ vid, pid });
+        SetIgnoredDeviceIds(ids);
+    }
+    for (auto it = g_entries.begin(); it != g_entries.end();) {
+        if (it->second.st.vid == vid && it->second.st.pid == pid) {
+            if (it->second.added) TrayDelete(it->second.uid);
+            if (it->second.icon) DestroyIcon(it->second.icon);
+            it = g_entries.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    RefreshDisplay();
+    SetEvent(g_refreshEvt);
+}
+
+void UnignoreDevice(size_t index) {
+    auto ids = IgnoredDeviceIds();
+    if (index >= ids.size()) return;
+    ids.erase(ids.begin() + index);
+    SetIgnoredDeviceIds(ids);
+    SetEvent(g_refreshEvt);
 }
 
 // Swaps a shown device with its neighbour (dir -1 = left, +1 = right) and remembers the new order.
@@ -573,6 +832,27 @@ void ShowMenu() {
         AppendMenuW(sub, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(sub, MF_STRING | (canLeft ? 0 : MF_GRAYED), base + DEV_LEFT, g_wantWidget ? L"Move left" : L"Move up");
         AppendMenuW(sub, MF_STRING | (canRight ? 0 : MF_GRAYED), base + DEV_RIGHT, g_wantWidget ? L"Move right" : L"Move down");
+        AppendMenuW(sub, MF_SEPARATOR, 0, nullptr);
+        {
+            HMENU lowMenu = CreatePopupMenu();
+            auto own = g_deviceLow.find(k);
+            UINT checked = own == g_deviceLow.end() ? base + DEV_LOW_DEFAULT : own->second == 0 ? base + DEV_LOW_NEVER : 0;
+            AppendMenuW(lowMenu, MF_STRING, base + DEV_LOW_DEFAULT, (L"Default (" + std::to_wstring(g_lowDefault) + L"%)").c_str());
+            AppendMenuW(lowMenu, MF_STRING, base + DEV_LOW_NEVER, L"Never");
+            AppendMenuW(lowMenu, MF_SEPARATOR, 0, nullptr);
+            for (size_t i = 0; i < std::size(kLowChoices); i++) {
+                AppendMenuW(lowMenu, MF_STRING, base + DEV_LOW_FIRST + (UINT)i, (std::to_wstring(kLowChoices[i]) + L"%").c_str());
+                if (own != g_deviceLow.end() && own->second == kLowChoices[i]) checked = base + DEV_LOW_FIRST + (UINT)i;
+            }
+            CheckMenuRadioItem(lowMenu, base + DEV_LOW_DEFAULT, base + DEV_LOW_FIRST + (UINT)std::size(kLowChoices) - 1, checked, MF_BYCOMMAND);
+            AppendMenuW(sub, MF_POPUP, (UINT_PTR)lowMenu, L"Low battery warning at");
+        }
+        if (e->st.vid) {
+            int sharing = 0;  // devices reported through the same receiver
+            for (TrayEntry* o : all) sharing += o->st.vid == e->st.vid && o->st.pid == e->st.pid;
+            std::wstring label = L"Never query " + UsbId(e->st.vid, e->st.pid) + (sharing > 1 ? L" (and the other devices on it)" : L"");
+            AppendMenuW(sub, MF_STRING, base + DEV_IGNORE, label.c_str());
+        }
         std::wstring line = e->st.name + L":  " + StatusText(*e) + L"   [" + e->st.via + L"]";
         AppendMenuW(m, MF_POPUP | (IsHidden(k) ? 0 : MF_CHECKED), (UINT_PTR)sub, line.c_str());
         keys.push_back(k);
@@ -584,6 +864,36 @@ void ShowMenu() {
     CheckMenuRadioItem(m, ID_MODE_WIDGET, ID_MODE_TRAY, g_wantWidget ? ID_MODE_WIDGET : ID_MODE_TRAY, MF_BYCOMMAND);
     UINT bgFlags = MF_STRING | (g_widgetBackground ? MF_CHECKED : 0) | (g_wantWidget ? 0 : MF_GRAYED);
     AppendMenuW(m, bgFlags, ID_WIDGET_BACKGROUND, L"Background behind taskbar text (for transparent taskbars)");
+    {
+        HMENU settings = CreatePopupMenu();
+        HMENU lowMenu = CreatePopupMenu();
+        for (size_t i = 0; i < std::size(kLowChoices); i++)
+            AppendMenuW(lowMenu, MF_STRING, ID_LOW_FIRST + (UINT)i, (std::to_wstring(kLowChoices[i]) + L"%").c_str());
+        size_t lowIdx = std::find(std::begin(kLowChoices), std::end(kLowChoices), g_lowDefault) - std::begin(kLowChoices);
+        CheckMenuRadioItem(lowMenu, ID_LOW_FIRST, ID_LOW_FIRST + (UINT)std::size(kLowChoices) - 1, ID_LOW_FIRST + (UINT)lowIdx, MF_BYCOMMAND);
+        AppendMenuW(settings, MF_POPUP, (UINT_PTR)lowMenu, L"Low battery warning at");
+        AppendMenuW(settings, MF_STRING | (g_notifyLow ? MF_CHECKED : 0), ID_NOTIFY_LOW, L"Low battery notifications");
+        AppendMenuW(settings, MF_SEPARATOR, 0, nullptr);
+        HMENU every = CreatePopupMenu();
+        const wchar_t* intervalNames[] = { L"30 seconds", L"1 minute", L"2 minutes", L"5 minutes", L"10 minutes" };
+        static_assert(std::size(intervalNames) == std::size(kIntervalChoices), "one name per interval");
+        for (size_t i = 0; i < std::size(kIntervalChoices); i++) AppendMenuW(every, MF_STRING, ID_INTERVAL_FIRST + (UINT)i, intervalNames[i]);
+        size_t secIdx = std::find(std::begin(kIntervalChoices), std::end(kIntervalChoices), (int)(g_pollMs / 1000)) - std::begin(kIntervalChoices);
+        CheckMenuRadioItem(every, ID_INTERVAL_FIRST, ID_INTERVAL_FIRST + (UINT)std::size(kIntervalChoices) - 1, ID_INTERVAL_FIRST + (UINT)secIdx,
+                           MF_BYCOMMAND);
+        AppendMenuW(settings, MF_POPUP, (UINT_PTR)every, L"Refresh every");
+        AppendMenuW(settings, MF_STRING | (g_adaptive ? MF_CHECKED : 0), ID_ADAPTIVE, L"Ask devices less often while nothing changes");
+        auto ignored = IgnoredDeviceIds();
+        if (!ignored.empty()) {
+            HMENU ign = CreatePopupMenu();
+            AppendMenuW(ign, MF_STRING | MF_GRAYED, 0, L"Click one to query it again");
+            for (size_t i = 0; i < ignored.size() && i < (size_t)kMaxIgnored; i++)
+                AppendMenuW(ign, MF_STRING, ID_UNIGNORE_FIRST + (UINT)i, UsbId(ignored[i].first, ignored[i].second).c_str());
+            AppendMenuW(settings, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(settings, MF_POPUP, (UINT_PTR)ign, L"Devices never queried");
+        }
+        AppendMenuW(m, MF_POPUP, (UINT_PTR)settings, L"Settings");
+    }
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, ID_REFRESH, L"Refresh now");
     AppendMenuW(m, MF_STRING | (AutostartEnabled() ? MF_CHECKED : 0), ID_AUTOSTART, L"Start with Windows");
@@ -605,13 +915,31 @@ void ShowMenu() {
         case ID_MODE_TRAY: SetMode(false); break;
         case ID_SUPPORT: ShellExecuteW(nullptr, L"open", L"https://github.com/sponsors/krisgfx9", nullptr, nullptr, SW_SHOWNORMAL); break;
         case ID_EXIT: DestroyWindow(g_hwnd); break;
+        case ID_NOTIFY_LOW: SetNotifyLow(!g_notifyLow); break;
+        case ID_ADAPTIVE: SetAdaptive(!g_adaptive); break;
         default:
-            if (cmd >= ID_DEVICE_FIRST && cmd < ID_DEVICE_FIRST + keys.size() * DEV_STRIDE) {
+            if (cmd >= ID_LOW_FIRST && cmd < ID_LOW_FIRST + std::size(kLowChoices)) {
+                SetLowDefault(kLowChoices[cmd - ID_LOW_FIRST]);
+            } else if (cmd >= ID_INTERVAL_FIRST && cmd < ID_INTERVAL_FIRST + std::size(kIntervalChoices)) {
+                SetInterval(kIntervalChoices[cmd - ID_INTERVAL_FIRST]);
+            } else if (cmd >= ID_UNIGNORE_FIRST && cmd < ID_UNIGNORE_FIRST + (UINT)kMaxIgnored) {
+                UnignoreDevice(cmd - ID_UNIGNORE_FIRST);
+            } else if (cmd >= ID_DEVICE_FIRST && cmd < ID_DEVICE_FIRST + keys.size() * DEV_STRIDE) {
                 std::wstring key = keys[(cmd - ID_DEVICE_FIRST) / DEV_STRIDE];
-                switch ((cmd - ID_DEVICE_FIRST) % DEV_STRIDE) {
+                UINT sub = (cmd - ID_DEVICE_FIRST) % DEV_STRIDE;
+                switch (sub) {
                     case DEV_TOGGLE: ToggleHidden(key); break;
                     case DEV_LEFT:   MoveEntry(key, -1); break;
                     case DEV_RIGHT:  MoveEntry(key, +1); break;
+                    case DEV_LOW_DEFAULT: SetDeviceLow(key, -1); break;
+                    case DEV_LOW_NEVER:   SetDeviceLow(key, 0); break;
+                    case DEV_IGNORE: {
+                        auto it = g_entries.find(key);
+                        if (it != g_entries.end() && it->second.st.vid) IgnoreDevice(it->second.st.vid, it->second.st.pid);
+                        break;
+                    }
+                    default:
+                        if (sub >= DEV_LOW_FIRST && sub < DEV_LOW_FIRST + std::size(kLowChoices)) SetDeviceLow(key, kLowChoices[sub - DEV_LOW_FIRST]);
                 }
             }
     }
@@ -619,12 +947,27 @@ void ShowMenu() {
 
 // ---- worker thread ----------------------------------------------------------------------------
 
+PollOptions WorkerOptions(bool force) {
+    PollOptions o;
+    o.force = force;
+    o.nowMs = GetTickCount64();
+    o.baseIntervalMs = g_pollMs;
+    o.maxIntervalMs = std::max<uint64_t>(5 * 60 * 1000, g_pollMs);
+    o.adaptive = g_adaptive;
+    o.parallel = g_parallel;
+    return o;
+}
+
 DWORD WINAPI Worker(LPVOID) {
+    PollScheduler scheduler(AllDrivers());  // lives as long as the thread: remembers results between polls
+    bool force = true;                      // the first poll asks every device
     for (;;) {
-        auto* v = new std::vector<DeviceStatus>(PollAllDevices());
+        auto* v = new std::vector<DeviceStatus>(PollAllDevices(scheduler, WorkerOptions(force)));
         if (!PostMessageW(g_hwnd, WM_RESULTS, 0, (LPARAM)v)) delete v;
         HANDLE hs[2] = { g_stopEvt, g_refreshEvt };
-        if (WaitForMultipleObjects(2, hs, FALSE, POLL_INTERVAL_MS) == WAIT_OBJECT_0) return 0;
+        DWORD r = WaitForMultipleObjects(2, hs, FALSE, g_pollMs);
+        if (r == WAIT_OBJECT_0) return 0;
+        force = r == WAIT_OBJECT_0 + 1;  // Refresh now, a device plugged in or removed, resume: ask everything
     }
 }
 
@@ -684,14 +1027,22 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 if (e.icon) DestroyIcon(e.icon);
             }
             if (g_placeholder) TrayDelete(PLACEHOLDER_ID);
+            if (g_notice) TrayDelete(NOTICE_ID);
             PostQuitMessage(0);
             return 0;
     }
     return DefWindowProcW(h, msg, wp, lp);
 }
 
-// `WirelessBattery.exe --list` prints what it finds, `--dump` every HID collection.
-int ListToConsole(bool dump) {
+// `WirelessBattery.exe --list` prints what it finds, `--dump` every HID collection. With --list:
+//   --json        machine-readable output (json_report.h)
+//   --timing      how long each driver took, and whether drivers ran in parallel
+//   --sequential  run the drivers one after another (as before parallel polling)
+struct ListFlags {
+    bool dump = false, json = false, timing = false, sequential = false;
+};
+
+int ListToConsole(const ListFlags& flags) {
     HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
     if (!out || out == INVALID_HANDLE_VALUE) {
         if (AttachConsole(ATTACH_PARENT_PROCESS)) out = CreateFileW(L"CONOUT$", GENERIC_WRITE, FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
@@ -703,13 +1054,27 @@ int ListToConsole(bool dump) {
         DWORD w;
         WriteFile(out, u.data(), (DWORD)u.size(), &w, nullptr);
     };
-    if (dump) {
+    if (flags.dump) {
         write(DumpHidCollections());
         return 0;
     }
-    auto list = PollAllDevices();
+    PollScheduler scheduler(AllDrivers());
+    PollOptions opt;
+    opt.force = true;
+    opt.parallel = !flags.sequential && LoadBoolSetting(L"ParallelPolling", true);
+    auto list = PollAllDevices(scheduler, opt);
+    const PollReport& report = scheduler.Report();
+    std::vector<int64_t> left;
+    for (auto& s : list) left.push_back(s.charging || s.percent < 0 ? -1 : LoadTrend(s.key).RemainingSec(WallClock()));
+    if (flags.json) {
+        std::string j = DevicesToJson(list, left);
+        DWORD w;
+        WriteFile(out, j.data(), (DWORD)j.size(), &w, nullptr);
+        return 0;
+    }
     if (list.empty()) write(L"No devices with battery info found.\n");
-    for (auto& s : list) {
+    for (size_t i = 0; i < list.size(); i++) {
+        auto& s = list[i];
         std::wstring line = s.name + L"  [" + s.via + L"]  ";
         if (!s.connected) line += L"off / not connected";
         else if (s.asleep) line += L"asleep";
@@ -719,7 +1084,22 @@ int ListToConsole(bool dump) {
         if (!s.detail.empty()) line += L" (" + s.detail + L")";
         if (s.charging) line += L", charging";
         if (s.millivolts) line += L", " + std::to_wstring(s.millivolts) + L" mV";
+        std::wstring est = FormatRemaining(left[i]);
+        if (!est.empty()) line += L", " + est + L" left";
         write(line + L"   (" + s.key + L")\n");
+    }
+    auto widen = [](const std::string& s) { return std::wstring(s.begin(), s.end()); };  // ASCII
+    for (const auto& v : report.violations) write(L"warning: " + widen(v) + L" (please report this)\n");
+    if (flags.timing) {
+        wchar_t line[160];
+        swprintf(line, 160, L"\n%ls, %d thread(s), %.0f ms in total\n", report.parallel ? L"parallel" : L"one after another", report.threads,
+                 report.totalMs);
+        write(line);
+        for (const auto& t : report.timings) {
+            if (t.ms < 1 && !t.devices) continue;  // drivers that found nothing to talk to
+            swprintf(line, 160, L"  %-18ls %7.0f ms  %d device(s)\n", widen(t.name).c_str(), t.ms, t.devices);
+            write(line);
+        }
     }
     return 0;
 }
@@ -727,8 +1107,14 @@ int ListToConsole(bool dump) {
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
-    if (cmdLine && wcsstr(cmdLine, L"--list")) return ListToConsole(false);
-    if (cmdLine && wcsstr(cmdLine, L"--dump")) return ListToConsole(true);
+    if (cmdLine && (wcsstr(cmdLine, L"--list") || wcsstr(cmdLine, L"--dump") || wcsstr(cmdLine, L"--json"))) {
+        ListFlags f;
+        f.dump = wcsstr(cmdLine, L"--dump") != nullptr;
+        f.json = wcsstr(cmdLine, L"--json") != nullptr;
+        f.timing = wcsstr(cmdLine, L"--timing") != nullptr;
+        f.sequential = wcsstr(cmdLine, L"--sequential") != nullptr;
+        return ListToConsole(f);
+    }
     if (cmdLine && wcsstr(cmdLine, L"--quit")) {  // used by the installer before upgrading/uninstalling
         if (HWND w = FindWindowW(L"WirelessBatteryWnd", nullptr)) {
             PostMessageW(w, WM_CLOSE, 0, 0);
@@ -764,6 +1150,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
     g_wantWidget = LoadWidgetMode();
     g_hideLastKnown = LoadHideLastKnown();
     g_widgetBackground = LoadWidgetBackground();
+    LoadSettings();
     widget::SetBackground(g_widgetBackground);  // remembered by the widget across re-creation
     LoadHidden();
     LoadOrder();

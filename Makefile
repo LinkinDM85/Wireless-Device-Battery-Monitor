@@ -23,35 +23,26 @@ build/app_res.o: res/app.rc res/app.manifest res/app.ico
 clean:
 	rm -rf build WirelessBattery.exe
 
+# Every tests/*_test.cpp is built and run. The first line of each test names the sources it links
+# against ("// test-sources: src/drivers/x.cpp" or "(none)"), so a new test needs no Makefile change.
+# The Linux HID test needs the Linux backend and runs from build-linux.sh instead.
+TESTS := $(filter-out tests/linux_hid_test.cpp,$(sort $(wildcard tests/*_test.cpp)))
+
 test:
-	@mkdir -p build
-	$(CXX) $(CXXFLAGS) tests/astro_driver_test.cpp src/drivers/astro.cpp -o build/astro_driver_test.exe
-	./build/astro_driver_test.exe
-	$(CXX) $(CXXFLAGS) tests/steelseries_mouse_test.cpp src/drivers/steelseries.cpp -o build/steelseries_mouse_test.exe
-	./build/steelseries_mouse_test.exe
-	$(CXX) -std=c++17 -O2 -Wall tests/rapoo_protocol_test.cpp -o build/rapoo_protocol_test.exe
-	./build/rapoo_protocol_test.exe
-	$(CXX) $(CXXFLAGS) tests/rapoo_driver_test.cpp src/drivers/rapoo.cpp -o build/rapoo_driver_test.exe
-	./build/rapoo_driver_test.exe
-	$(CXX) $(CXXFLAGS) tests/ninjutso_driver_test.cpp src/drivers/ninjutso.cpp -o build/ninjutso_driver_test.exe
-	./build/ninjutso_driver_test.exe
-	$(CXX) $(CXXFLAGS) tests/ninjutso_cable_test.cpp src/drivers/ninjutso.cpp -o build/ninjutso_cable_test.exe
-	./build/ninjutso_cable_test.exe
-	$(CXX) $(CXXFLAGS) tests/machenike_driver_test.cpp src/drivers/machenike.cpp -o build/machenike_driver_test.exe
-	./build/machenike_driver_test.exe
-	$(CXX) $(CXXFLAGS) tests/mchose_modern_driver_test.cpp src/drivers/mchose_modern.cpp -o build/mchose_modern_driver_test.exe
-	./build/mchose_modern_driver_test.exe
-	$(CXX) $(CXXFLAGS) tests/vaxee_driver_test.cpp src/drivers/vaxee.cpp -o build/vaxee_driver_test.exe
-	./build/vaxee_driver_test.exe
-	$(CXX) $(CXXFLAGS) tests/finalmouse_driver_test.cpp src/drivers/finalmouse.cpp -o build/finalmouse_driver_test.exe
-	./build/finalmouse_driver_test.exe
-	$(CXX) $(CXXFLAGS) tests/keychron_driver_test.cpp src/drivers/keychron.cpp -o build/keychron_driver_test.exe
-	./build/keychron_driver_test.exe
-	$(CXX) $(CXXFLAGS) tests/hyperx_haste_driver_test.cpp src/drivers/hyperx.cpp -o build/hyperx_haste_driver_test.exe
-	./build/hyperx_haste_driver_test.exe
-	$(CXX) -std=c++17 -O2 -Wall tests/galaxy_buds_protocol_test.cpp -o build/galaxy_buds_protocol_test.exe
-	./build/galaxy_buds_protocol_test.exe
-	$(CXX) -std=c++17 -O2 -Wall tests/logitech_g435_0adf_test.cpp -o build/logitech_g435_0adf_test.exe
-	./build/logitech_g435_0adf_test.exe
+	@mkdir -p build/tests
+	@failed=""; \
+	for t in $(TESTS); do \
+	    n=$$(basename $$t .cpp); \
+	    src=$$(sed -n '1s|^// test-sources:||p' $$t); \
+	    case "$$src" in *"(none)"*) src="";; esac; \
+	    if [ -z "$$(sed -n '1p' $$t | grep '^// test-sources:')" ]; then \
+	        echo "$$t: first line must be // test-sources: ..."; failed="$$failed $$n"; continue; \
+	    fi; \
+	    echo "== $$n"; \
+	    if $(CXX) $(CXXFLAGS) $$t $$src -o build/tests/$$n.exe $(LIBS) && ./build/tests/$$n.exe; then :; \
+	    else failed="$$failed $$n"; [ -n "$$GITHUB_ACTIONS" ] && echo "::error title=Test failed::$$n"; fi; \
+	done; \
+	if [ -n "$$failed" ]; then echo "FAILED:$$failed"; exit 1; fi; \
+	echo "All $(words $(TESTS)) tests passed."
 
 .PHONY: clean test

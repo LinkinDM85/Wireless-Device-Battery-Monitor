@@ -14,23 +14,36 @@ struct PollContext {
     std::set<std::pair<USHORT, USHORT>> claimed;
     std::set<std::wstring> btContainers;  // container ids PollBluetooth already reported
     std::vector<DeviceStatus> out;
+    // Every vendor id a driver asked about through the helpers below. The scheduler compares it
+    // with the vendor ids the driver declared in registry.cpp (see poll_scheduler.h).
+    mutable std::set<USHORT> requested;
 
-    bool IsClaimed(USHORT vid, USHORT pid) const { return claimed.count({ vid, pid }) != 0; }
-    void Claim(USHORT vid, USHORT pid) { claimed.insert({ vid, pid }); }
+    bool IsClaimed(USHORT vid, USHORT pid) const {
+        requested.insert(vid);
+        return claimed.count({ vid, pid }) != 0;
+    }
+    void Claim(USHORT vid, USHORT pid) {
+        requested.insert(vid);
+        claimed.insert({ vid, pid });
+    }
     void Add(const DeviceStatus& s, USHORT vid, USHORT pid) {
         out.push_back(s);
+        out.back().vid = vid;
+        out.back().pid = pid;
         Claim(vid, pid);
     }
     // Distinct (vid, pid) pairs for a vendor that are not claimed yet.
     std::vector<std::pair<USHORT, USHORT>> Products(USHORT vid) const {
+        requested.insert(vid);
         std::set<std::pair<USHORT, USHORT>> s;
         for (const auto& c : colls)
-            if (c.vid == vid && !IsClaimed(c.vid, c.pid)) s.insert({ c.vid, c.pid });
+            if (c.vid == vid && !claimed.count({ c.vid, c.pid })) s.insert({ c.vid, c.pid });
         return { s.begin(), s.end() };
     }
     // Collections of one product, optionally filtered.
     template <class Pred>
     std::vector<const HidColl*> Find(USHORT vid, USHORT pid, Pred pred) const {
+        requested.insert(vid);
         std::vector<const HidColl*> r;
         for (const auto& c : colls)
             if (c.vid == vid && c.pid == pid && pred(c)) r.push_back(&c);
@@ -59,6 +72,7 @@ void PollNinjutso(PollContext& ctx);  // Sora V2 (1915:AE1C 1K receiver, AE11 ca
 void PollNinjutso(PollContext& ctx);  // Sora V2 1K receiver (1915:AE1C) and Ten / Ten Air (093A:EB01 / 093A:E020)
 void PollSprime(PollContext& ctx);    // Sprime PM1 (1915:AC1C / AD8C receivers, AC11-AC13 cable)
 void PollRongyuan(PollContext& ctx);  // Rongyuan receivers (Attack Shark, Ajazz keyboards, ...)
+std::vector<USHORT> RongyuanVendorIds();  // vendor ids in its receiver table (it scans the collections itself)
 void PollSonyInzone(PollContext& ctx);  // Sony INZONE H9 II / H5 / Buds
 void PollSonix(PollContext& ctx);     // SONiX keyboards on their 2.4 GHz dongle (AJAZZ AK820 MAX, AK980 V2, AULA F108 Pro)
 void PollFractal(PollContext& ctx);   // Fractal Design Scape headset (dongle or cable)

@@ -1,3 +1,4 @@
+// test-sources: src/drivers/dareu.cpp
 // Exercise the real driver with a simulated transport; no hardware commands are sent.
 #include "../src/drivers/drivers.h"
 

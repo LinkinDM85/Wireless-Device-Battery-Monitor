@@ -1,3 +1,4 @@
+// test-sources: src/drivers/steelseries.cpp
 // Exercise the real Aerox/Prime driver with a simulated HID transport; no hardware writes.
 #include "../src/drivers/drivers.h"
 

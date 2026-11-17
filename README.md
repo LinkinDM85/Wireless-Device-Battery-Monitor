@@ -26,15 +26,17 @@ Battery levels of your wireless mouse, headset, keyboard and controller, right o
 ## Display
 
 **On the taskbar (default):** `🎧 30%  🖱 93%` next to the notification area, drawn with the Windows icon font.
-- **Low battery:** a red number means 15% or less.
+- **Low battery:** a red number means 15% or less (adjustable, also per device). A "Low battery" notification appears once per discharge; while a device is low, a small red tray icon shows its level.
 - **Charging:** a blue ⚡ appears next to the number.
 - **Asleep:** dimmed text means the device is asleep and the last known value is shown.
 - **Theme:** it follows light/dark mode and DPI scaling.
 - **Transparent taskbar themes** (e.g. Windhawk's Taskbar Styler): turn on *Background behind taskbar text* in the menu to keep the text readable over the wallpaper.
 
-**Tray icons:** one icon per device with the number drawn in it, plus a "Low battery" notification at 15%. The app switches to this automatically when the taskbar is vertical or can't be found.
+**Tray icons:** one icon per device with the number drawn in it, plus a "Low battery" notification at 15% (adjustable). The app switches to this automatically when the taskbar is vertical or can't be found.
 
-Hover for details. Click for the menu: every device (click one to hide or show it), display mode, *Refresh now*, *Start with Windows*, and *Exit*. Levels refresh every 60 seconds, and right away when a device is plugged in or the PC wakes up.
+Hover for details, including an estimate of the time left (e.g. `~3 days left`) once the level has dropped a few percent. Click for the menu: every device (point at one to show, hide or move it, set its own warning level, or stop the app from querying it), display mode, *Settings*, *Refresh now*, *Start with Windows*, and *Exit*.
+
+**Settings:** the warning level (5–40 %), low battery notifications on or off, how often to refresh (30 seconds to 10 minutes, default 1 minute), and *Ask devices less often while nothing changes* (on by default: a device that keeps reporting the same level is asked every 2, then 4, then 5 minutes, and asleep or switched-off devices every 5 minutes, so polling does not keep waking them). Every device is asked again right away when one is plugged in or removed, when the PC wakes up, and on *Refresh now*.
 
 ## Supported devices
 
@@ -137,18 +139,25 @@ The installer adds a Start menu entry and an uninstaller (*Settings → Apps*), 
 when you sign in. Prefer no installer? Download `WirelessBattery-<version>-portable.zip`, unzip it
 anywhere and run `WirelessBattery.exe`.
 
+**Package managers:** every release also carries a Scoop manifest, so `scoop install https://github.com/<owner>/Wireless-Device-Battery-Monitor/releases/latest/download/wireless-battery.json` installs the portable version, and winget manifests ready to submit. See [docs/distribution.md](docs/distribution.md).
+
 **Notes:**
 - **SmartScreen warning:** the exe is not code-signed, so Windows may say "Windows protected your PC". Click *More info → Run anyway*, or build it yourself.
 - **Tray-icon mode on Windows 11:** new tray icons go to the `^` overflow. Drag them onto the taskbar or enable them in *Settings → Personalization → Taskbar → Other system tray icons*.
-- **Keeping the app away from a device:** if a device misbehaves while the app is running, list it in the registry string `IgnoreDevices` under `HKCU\Software\WirelessBattery` as `VID:PID` pairs (hex, separated by commas, e.g. `28BD:0947, 1234:ABCD`; `--dump` shows the ids). The app then never opens it. Drawing tablets are skipped automatically.
+- **Keeping the app away from a device:** if a device misbehaves while the app is running, point at it in the menu and choose *Never query VID:PID* (undo it under *Settings → Devices never queried*), or list it in the registry string `IgnoreDevices` under `HKCU\Software\WirelessBattery` as `VID:PID` pairs (hex, separated by commas, e.g. `28BD:0947, 1234:ABCD`; `--dump` shows the ids). The app then never opens it. Drawing tablets are skipped automatically.
 
 ## Command line
 
 ```
-WirelessBattery.exe --list   # print every device and its battery level, then exit
+WirelessBattery.exe --list               # print every device and its battery level, then exit
+WirelessBattery.exe --list --json        # the same as JSON (UTF-8), for scripts, Rainmeter, OBS and the like
+WirelessBattery.exe --list --timing      # also show how long each driver took and whether they ran in parallel
+WirelessBattery.exe --list --sequential  # run the drivers one after another (for troubleshooting)
 WirelessBattery.exe --dump   # print every HID collection, plus raw Xenta (1D57) status frames (useful when asking for a new device)
 WirelessBattery.exe --quit   # close the running instance
 ```
+
+`--json` prints `{ "devices": [ ... ] }` with `key`, `name`, `via`, `kind`, `percent`, `level`, `detail`, `charging`, `asleep`, `connected`, `millivolts`, `vid`, `pid` and `estimatedSecondsLeft` for each device; unknown values are `null`.
 
 ## Build
 
@@ -223,6 +232,8 @@ the remaining vendors are planned follow-up phases.
 ## How it works
 
 Each vendor driver in [`src/drivers/`](src/drivers) recognises its devices by USB vendor and product ID, and only ever sends read-only battery queries. Unknown devices are never written to. The generic fallbacks (HID battery usage, Bluetooth, XInput, HeadsetControl) only look at devices no vendor driver has claimed.
+
+[`src/drivers/registry.cpp`](src/drivers/registry.cpp) lists the drivers in the order they run, each with the vendor ids it may touch. Drivers that share a vendor id run one after another in that order; groups with nothing in common run at the same time, each seeing only its own vendors' devices ([`src/poll_scheduler.h`](src/poll_scheduler.h)). A driver that asks about a vendor id it did not declare makes the app go back to running everything one after another, and `--list` reports it. `tests/driver_registry_test.cpp` checks the declarations.
 
 The taskbar widget is a layered child window of `Shell_TrayWnd`, placed left of `TrayNotifyWnd`. If Explorer restarts, it is re-created.
 

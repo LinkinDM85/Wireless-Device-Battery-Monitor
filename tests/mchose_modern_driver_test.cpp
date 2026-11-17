@@ -1,3 +1,4 @@
+// test-sources: src/drivers/mchose_modern.cpp
 // Exercise the production MCHOSE "new" driver with simulated replies; no hardware access.
 #include "../src/drivers/drivers.h"
 

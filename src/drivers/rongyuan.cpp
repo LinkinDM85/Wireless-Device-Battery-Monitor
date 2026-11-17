@@ -41,6 +41,13 @@ bool QueryStatus(HidDev& d, std::vector<BYTE>& reply) {
 
 }  // namespace
 
+std::vector<USHORT> RongyuanVendorIds() {
+    std::vector<USHORT> v;
+    for (UINT key : kReceivers)
+        if (std::find(v.begin(), v.end(), (USHORT)(key >> 16)) == v.end()) v.push_back((USHORT)(key >> 16));
+    return v;
+}
+
 void PollRongyuan(PollContext& ctx) {
     std::vector<std::pair<USHORT, USHORT>> products;
     for (const auto& c : ctx.colls)

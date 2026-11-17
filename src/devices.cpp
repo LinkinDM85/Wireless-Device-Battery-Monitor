@@ -1,20 +1,19 @@
-// Runs every driver in order. Vendor drivers go first and claim the devices they handle; the
-// generic fallbacks then only look at what is left.
+// Polls every driver (the list and its order are in drivers/registry.cpp, poll_scheduler.cpp runs
+// it). Vendor drivers claim the devices they handle; the generic fallbacks only look at what is left.
 #include "devices.h"
 
 #include <algorithm>
 #include <cstdio>
 #include <cwchar>
 
-#include "drivers/drivers.h"
+#include "drivers/registry.h"
 #include "hid.h"
-
-namespace {
+#include "poll_scheduler.h"
 
 // HKCU\Software\WirelessBattery\IgnoreDevices (REG_SZ): "VID:PID" pairs in hex, separated by spaces,
 // commas or semicolons (e.g. "28BD:0947, 046D:C547"). No driver ever opens those devices (issue #232).
-std::vector<std::pair<USHORT, USHORT>> IgnoredDevices() {
-    std::vector<std::pair<USHORT, USHORT>> out;
+std::vector<std::pair<unsigned short, unsigned short>> IgnoredDeviceIds() {
+    std::vector<std::pair<unsigned short, unsigned short>> out;
     wchar_t buf[1024];
     DWORD size = sizeof(buf);
     if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\WirelessBattery", L"IgnoreDevices", RRF_RT_REG_SZ, nullptr, buf, &size) !=
@@ -34,75 +33,42 @@ std::vector<std::pair<USHORT, USHORT>> IgnoredDevices() {
     return out;
 }
 
+void SetIgnoredDeviceIds(const std::vector<std::pair<unsigned short, unsigned short>>& ids) {
+    std::wstring v;
+    for (auto [vid, pid] : ids) {
+        wchar_t one[16];
+        swprintf(one, 16, L"%04X:%04X", vid, pid);
+        if (!v.empty()) v += L", ";
+        v += one;
+    }
+    RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\WirelessBattery", L"IgnoreDevices", REG_SZ, v.c_str(),
+                    (DWORD)((v.size() + 1) * sizeof(wchar_t)));
+}
+
+namespace {
+
+std::vector<HidColl> Collections() {
+    auto colls = EnumHid();
+    auto ignored = IgnoredDeviceIds();
+    if (!ignored.empty())
+        colls.erase(std::remove_if(colls.begin(), colls.end(), [&](const HidColl& c) {
+                        return std::find(ignored.begin(), ignored.end(), std::make_pair(c.vid, c.pid)) != ignored.end();
+                    }),
+                    colls.end());
+    return colls;
+}
+
 }  // namespace
 
+std::vector<DeviceStatus> PollAllDevices(PollScheduler& scheduler, const PollOptions& opt) {
+    return scheduler.Poll(Collections(), opt);
+}
+
 std::vector<DeviceStatus> PollAllDevices() {
-    PollContext ctx;
-    ctx.colls = EnumHid();
-    auto ignored = IgnoredDevices();
-    if (!ignored.empty())
-        ctx.colls.erase(std::remove_if(ctx.colls.begin(), ctx.colls.end(), [&](const HidColl& c) {
-                            return std::find(ignored.begin(), ignored.end(), std::make_pair(c.vid, c.pid)) != ignored.end();
-                        }),
-                        ctx.colls.end());
-    PollGlorious(ctx);
-    PollAula(ctx);       // before Kysona, which shares the 3554 vendor id and would probe it first
-    PollDareu(ctx);
-    PollDarmoshark(ctx);
-    PollAtkSerial(ctx);  // before Kysona, which shares the ATK vendor id
-    PollPulsar(ctx);     // before Kysona, which also scans the 3710 vendor id
-    PollAtkBitmouse(ctx);  // before Kysona, which would probe the NK dongle with the wrong protocol
-    PollKysona(ctx);
-    PollKeychron(ctx);
-    PollLamzu(ctx);
-    PollEndgame(ctx);
-    PollVaxee(ctx);
-    PollWlmouse(ctx);
-    PollFinalmouse(ctx);
-    PollNinjutso(ctx);
-    PollSprime(ctx);
-    PollRongyuan(ctx);
-    PollSonix(ctx);
-    PollSonyInzone(ctx);
-    PollFractal(ctx);
-    PollJabra(ctx);
-    PollJbl(ctx);
-    PollRog(ctx);
-    PollZowie(ctx);
-    PollRoyalKludge(ctx);
-    PollMchose(ctx);
-    PollRapoo(ctx);
-    PollAreson(ctx);
-    PollMchoseG3(ctx);
-    PollMsi(ctx);
-    PollMachenike(ctx);  // before Ajazz in PollMiscMice, which shares the L7's 248A vendor id
-    PollMchoseModern(ctx);
-    PollMiscMice(ctx);
-    PollFantech(ctx);
-    PollRazerHeadsets(ctx);  // before the generic Razer driver, which shares the vendor id
-    PollHyperX(ctx);
-    PollLogitechG435(ctx);  // before the HID++ driver, which shares the vendor id
-    PollAstro(ctx);
-    PollLogitech(ctx);
-    PollRazer(ctx);
-    PollSteelSeries(ctx);
-    PollCorsair(ctx);
-    PollCoolerMaster(ctx);
-    PollPlayStation(ctx);
-    PollSteamController(ctx);
-    PollGameSir(ctx);
-    PollFlydigi(ctx);
-    PollGameSirCyclone(ctx);
-    Poll8BitDo(ctx);
-    PollAirPods(ctx);  // before the Bluetooth fallback, which has no level for AirPods
-    PollPhoneLink(ctx);
-    PollGalaxyBuds(ctx);  // before the Bluetooth fallback, which skips devices already listed by name
-    PollMoondrop(ctx);
-    PollHeadsetControl(ctx);
-    PollBluetooth(ctx);   // before the generic HID check: Windows' own level wins for the same device
-    PollGenericHid(ctx);
-    PollXInput(ctx);
-    return ctx.out;
+    PollScheduler scheduler(AllDrivers());
+    PollOptions opt;
+    opt.force = true;
+    return scheduler.Poll(Collections(), opt);
 }
 
 std::wstring DumpHidCollections() {

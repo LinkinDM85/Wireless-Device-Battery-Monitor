@@ -1,3 +1,4 @@
+// test-sources: src/drivers/rapoo.cpp
 // Exercise the actual driver with a simulated HID transport; no USB writes or hardware needed.
 #include "../src/drivers/drivers.h"
 

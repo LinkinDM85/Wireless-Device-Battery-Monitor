@@ -22,13 +22,29 @@ jobs:
           msystem: MINGW64
           install: mingw-w64-x86_64-gcc make
 
+      # Turns compiler, linker and assert errors into annotations on the commit, so they can be read
+      # without opening the job log.
+      - name: Register error matchers
+        shell: bash
+        run: echo "::add-matcher::.github/gcc-problem-matcher.json"
+
       - name: Build WirelessBattery.exe
         shell: msys2 {0}
         run: make
 
-      - name: Test Rapoo protocol and driver
+      - name: Run tests
         shell: msys2 {0}
         run: make test
+
+      # Signing happens only when the repository has the WINDOWS_SIGNING_CERT / WINDOWS_SIGNING_PASSWORD
+      # secrets (docs/distribution.md); without them the step says so and the files stay unsigned.
+      # Pull requests from forks never get secrets, so their builds are never signed.
+      - name: Sign WirelessBattery.exe
+        shell: pwsh
+        env:
+          SIGN_CERT_BASE64: ${{ secrets.WINDOWS_SIGNING_CERT }}
+          SIGN_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PASSWORD }}
+        run: ./installer/sign.ps1 WirelessBattery.exe
 
       - name: Install Inno Setup
         shell: pwsh
@@ -39,6 +55,20 @@ jobs:
         run: |
           $version = if ($env:GITHUB_REF -like 'refs/tags/v*') { $env:GITHUB_REF_NAME.Substring(1) } else { '0.0.0' }
           ./installer/build-installer.ps1 -Version $version
+
+      - name: Sign the installer
+        shell: pwsh
+        env:
+          SIGN_CERT_BASE64: ${{ secrets.WINDOWS_SIGNING_CERT }}
+          SIGN_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PASSWORD }}
+        run: ./installer/sign.ps1 dist/WirelessBattery-Setup-*.exe
+
+      # winget and Scoop manifests with the hashes of the files above, published with the release.
+      - name: Write winget and Scoop manifests
+        shell: pwsh
+        run: |
+          $version = if ($env:GITHUB_REF -like 'refs/tags/v*') { $env:GITHUB_REF_NAME.Substring(1) } else { '0.0.0' }
+          ./installer/make-manifests.ps1 -Version $version -Repository $env:GITHUB_REPOSITORY
 
       - name: Fetch HeadsetControl source (GPL corresponding source for the bundled binary)
         shell: pwsh

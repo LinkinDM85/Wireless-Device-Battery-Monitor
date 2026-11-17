@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include <utility>
 #include <vector>
 
 enum class DeviceKind { Other, Mouse, Headset, Keyboard, Gamepad, Phone };
@@ -18,10 +19,21 @@ struct DeviceStatus {
     bool connected  = true;    // false: receiver present, device switched off (hidden)
     int  millivolts = 0;       // battery voltage when reported (0 = unknown)
     int  graceSec   = 0;       // keep showing the last value this long if the device stops answering
+    unsigned short vid = 0, pid = 0;  // USB ids, set by PollContext::Add (0 when the driver did not say)
 };
 
 // Queries every supported device. Blocking (can take a second or two); call from a worker thread.
 std::vector<DeviceStatus> PollAllDevices();
+
+// The same through a long-lived scheduler, which remembers results between polls so it can skip
+// devices that keep reporting the same thing (see poll_scheduler.h). Windows only.
+struct PollOptions;
+class PollScheduler;
+std::vector<DeviceStatus> PollAllDevices(PollScheduler& scheduler, const PollOptions& opt);
+
+// HKCU\Software\WirelessBattery\IgnoreDevices: "VID:PID" pairs that no driver ever opens. Windows only.
+std::vector<std::pair<unsigned short, unsigned short>> IgnoredDeviceIds();
+void SetIgnoredDeviceIds(const std::vector<std::pair<unsigned short, unsigned short>>& ids);
 
 // Prints every HID collection (for adding support for new devices).
 std::wstring DumpHidCollections();

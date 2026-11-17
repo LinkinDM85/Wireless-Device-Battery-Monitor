@@ -1,3 +1,4 @@
+// test-sources: (none)
 #include "../src/drivers/galaxy_buds_protocol.h"
 
 #include <cassert>
