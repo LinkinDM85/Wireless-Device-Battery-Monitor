@@ -42,8 +42,10 @@ Please open an issue with:
    }
    ```
 
-4. Declare the function in `src/drivers/drivers.h`, call it from `PollAllDevices()` in
-   `src/devices.cpp` (before the generic fallbacks). `build.bat` and the Makefile pick up new files automatically.
+4. Declare the function in `src/drivers/drivers.h` and add it to the list in
+   `src/drivers/registry.cpp` with every vendor id it looks at (before the generic fallbacks; if it
+   shares a vendor id with another driver, put the one that must look first above the other and say why).
+   `make test` checks the vendor ids. `build.bat` and the Makefile pick up new files automatically.
 5. Update the device table in `README.md`.
 
 ### Rules for drivers
