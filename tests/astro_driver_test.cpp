@@ -1,3 +1,4 @@
+// test-sources: src/drivers/astro.cpp
 #include "../src/drivers/drivers.h"
 #include <cassert>
 #include <cstdio>

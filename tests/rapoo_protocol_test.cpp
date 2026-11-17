@@ -1,3 +1,4 @@
+// test-sources: (none)
 #include "../src/drivers/rapoo_protocol.h"
 
 #include <cassert>

@@ -1,3 +1,4 @@
+// test-sources: src/drivers/machenike.cpp
 // Production poller with a simulated HID transport; fixtures captured from an L7 Arctic.
 #include "../src/drivers/drivers.h"
 

@@ -1,3 +1,4 @@
+// test-sources: src/drivers/ninjutso.cpp
 // Exercise the production driver with simulated replies; no hardware access.
 #include "../src/drivers/drivers.h"
 

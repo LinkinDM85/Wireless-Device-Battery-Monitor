@@ -1,3 +1,4 @@
+// test-sources: src/drivers/keychron.cpp
 // Exercise the Keychron mouse driver with a simulated HID transport; no hardware access.
 #include "../src/drivers/drivers.h"
 

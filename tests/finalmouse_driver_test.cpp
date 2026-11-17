@@ -1,3 +1,4 @@
+// test-sources: src/drivers/finalmouse.cpp
 // Exercise the Finalmouse driver with a simulated HID transport; no hardware access.
 #include "../src/drivers/drivers.h"
 

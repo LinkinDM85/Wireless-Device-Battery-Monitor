@@ -1,0 +1,38 @@
+{
+  "problemMatcher": [
+    {
+      "owner": "gcc-error",
+      "pattern": [
+        {
+          "regexp": "^(.*?):(\\d+):(\\d+):\\s+(?:fatal\\s+)?(error):\\s+(.*)$",
+          "file": 1,
+          "line": 2,
+          "column": 3,
+          "severity": 4,
+          "message": 5
+        }
+      ]
+    },
+    {
+      "owner": "ld-error",
+      "pattern": [
+        {
+          "regexp": "^.*?ld(?:\\.exe)?: .*?:(.*?):\\(.*?\\): (undefined reference to .*)$",
+          "file": 1,
+          "message": 2
+        }
+      ]
+    },
+    {
+      "owner": "assert-failed",
+      "pattern": [
+        {
+          "regexp": "^Assertion failed: (.*), file (.*), line (\\d+)$",
+          "message": 1,
+          "file": 2,
+          "line": 3
+        }
+      ]
+    }
+  ]
+}

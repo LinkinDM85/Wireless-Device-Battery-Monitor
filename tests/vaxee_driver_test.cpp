@@ -1,3 +1,4 @@
+// test-sources: src/drivers/vaxee.cpp
 // Simulated HID replies; checks read-only commands, validation and device filtering.
 #include "../src/drivers/drivers.h"
 #include <cassert>

@@ -22,11 +22,17 @@ jobs:
           msystem: MINGW64
           install: mingw-w64-x86_64-gcc make
 
+      # Turns compiler, linker and assert errors into annotations on the commit, so they can be read
+      # without opening the job log.
+      - name: Register error matchers
+        shell: bash
+        run: echo "::add-matcher::.github/gcc-problem-matcher.json"
+
       - name: Build WirelessBattery.exe
         shell: msys2 {0}
         run: make
 
-      - name: Test Rapoo protocol and driver
+      - name: Run tests
         shell: msys2 {0}
         run: make test
 

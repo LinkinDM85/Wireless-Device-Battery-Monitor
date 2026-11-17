@@ -1,3 +1,4 @@
+// test-sources: (none)
 #include "../src/drivers/logitech_g435_0adf.h"
 
 #include <cassert>
